@@ -1,9 +1,10 @@
 name: Build and Release Executables
 
 on:
+  workflow_dispatch:
   push:
     tags:
-      - "v*"           # Runs when you push a tag like v1.0.0
+      - "v*"
 
 jobs:
   build:
