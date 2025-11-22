@@ -29,6 +29,14 @@ jobs:
       - name: Build executable
         run: pyinstaller --onefile yourscript.py
 
+      - name: Rename output
+        if: runner.os == 'Windows'
+        run: rename dist\\yourscript.exe dist\\yourscript-windows.exe
+
+      - name: Rename output (macOS)
+        if: runner.os == 'macOS'
+        run: mv dist/yourscript dist/yourscript-mac
+
       - name: Upload artifact
         uses: actions/upload-artifact@v3
         with:
