@@ -27,15 +27,15 @@ jobs:
         run: pip install pyinstaller
 
       - name: Build executable
-        run: pyinstaller --onefile yourscript.py
+        run: pyinstaller --onefile keyboard_simulator.py
 
       - name: Rename output
         if: runner.os == 'Windows'
-        run: rename dist\\yourscript.exe dist\\yourscript-windows.exe
+        run: rename dist\\keyboard_simulator.exe dist\\keyboard_simulator-windows.exe
 
       - name: Rename output (macOS)
         if: runner.os == 'macOS'
-        run: mv dist/yourscript dist/yourscript-mac
+        run: mv dist/keyboard_simulator dist/keyboard_simulator-mac
 
       - name: Upload artifact
         uses: actions/upload-artifact@v3
