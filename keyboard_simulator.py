@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
+import os
+import sys
+import json
 import time
 import math
 import random
+import shutil
+import threading
+import subprocess
+from urllib.request import urlopen
 import pyperclip
 from pynput.keyboard import Controller, Listener, Key
 
@@ -10,8 +17,13 @@ WPM = 80                   # Base typing speed in words per minute
 MIN_SPEED = 0.80            # Minimum speed multiplier (80% of base)
 MAX_SPEED = 1.20            # Maximum speed multiplier (120% of base)
 WAVE_FREQUENCY = 0.32        # How fast the speed oscillates (higher = faster changes)
+JITTER = 0.25               # Random +/- variation on every keystroke delay (0.25 = 25%)
 TYPO_PROBABILITY = 0.025     # Chance of making a typo (0.01 = 1%)
 CHARS_PER_WORD = 5          # Average characters per word
+
+# How long each key is held down (seconds). Real keys are never 0.
+KEY_HOLD_MIN = 0.04
+KEY_HOLD_MAX = 0.11
 
 # Typo type weights (higher = more likely)
 TYPO_DOUBLE_WEIGHT = 1.5      # Double-type character
@@ -43,6 +55,17 @@ PAUSE_AFTER_NEWLINE_PROBABILITY = 0.9 # Chance of pausing after typing a newline
 PAUSE_NEWLINE_MIN = 2.0               # Minimum pause duration for newline
 PAUSE_NEWLINE_MAX = 5.0               # Maximum pause duration for newline
 
+# Start/pause hotkey. Works from any app.
+HOTKEY = Key.f9
+
+# Background mode types into a Chrome tab through Chrome's DevTools port, so you
+# can keep using your keyboard and mouse elsewhere. False = old behaviour (types
+# into whatever window is focused). Override per run with --background / --foreground.
+BACKGROUND = True
+CHROME_PATH = ""            # Leave empty to auto-detect Chrome
+DEBUG_PORT = 9222
+CHROME_PROFILE = os.path.join(os.path.expanduser("~"), ".human-typing-chrome")
+
 # Keyboard proximity map for realistic typos
 ADJACENT_KEYS = {
     "a": ["q", "w", "s", "z"],
@@ -73,246 +96,267 @@ ADJACENT_KEYS = {
     "z": ["a", "s", "x"]
 }
 
-# ===== GLOBAL STATE =====
-typing = False
-keyboard = Controller()
-text = ""
-position = 0
-typed_buffer = []  # Track recently typed characters for delayed corrections
+running = threading.Event()  # set = typing, clear = paused
 
-def toggle_typing():
-    """Toggle typing on/off and remove the backtick."""
-    global typing
-    typing = not typing
-    time.sleep(0.01)
-    keyboard.press(Key.backspace)
-    keyboard.release(Key.backspace)
-    print("▶ Started typing" if typing else "⏸ Paused typing")
+# ===== KEY SENDERS =====
+# press(ch, hold) sends one full keystroke. '\b' means backspace.
 
-def on_press(key):
-    """Handle key press events."""
+OS_SPECIAL = {'\b': Key.backspace, '\n': Key.enter, '\t': Key.tab}
+
+def make_os_press():
+    """Real OS keystrokes into the focused window."""
+    keyboard = Controller()
+    def press(ch, hold):
+        k = OS_SPECIAL.get(ch, ch)
+        keyboard.press(k)
+        time.sleep(hold)
+        keyboard.release(k)
+    return press
+
+# US layout, so the page sees the same key/code/keyCode a real keyboard sends.
+SHIFTED = dict(zip('~!@#$%^&*()_+{}|:"<>?', '`1234567890-=[]\\;\',./'))
+PUNCT_CODES = {'`': ('Backquote', 192), '-': ('Minus', 189), '=': ('Equal', 187),
+               '[': ('BracketLeft', 219), ']': ('BracketRight', 221), '\\': ('Backslash', 220),
+               ';': ('Semicolon', 186), "'": ('Quote', 222), ',': ('Comma', 188),
+               '.': ('Period', 190), '/': ('Slash', 191), ' ': ('Space', 32)}
+NAMED_KEYS = {'\b': ('Backspace', 8, None), '\n': ('Enter', 13, '\r'), '\t': ('Tab', 9, '\t')}
+
+def key_event(ch):
+    """Return (DevTools key event fields, needs_shift) for one character."""
+    if ch in NAMED_KEYS:
+        name, vk, text = NAMED_KEYS[ch]
+        ev = dict(key=name, code=name, windowsVirtualKeyCode=vk)
+        if text:
+            ev['text'] = text
+        return ev, False
+    base = SHIFTED.get(ch, ch.lower())
+    shift = ch in SHIFTED or ch != base
+    if base.isascii() and base.isalpha():
+        code, vk = 'Key' + base.upper(), ord(base.upper())
+    elif base.isascii() and base.isdigit():
+        code, vk = 'Digit' + base, ord(base)
+    elif base in PUNCT_CODES:
+        code, vk = PUNCT_CODES[base]
+    else:
+        return dict(key=ch, text=ch), False  # no key for it on a US keyboard (é, “, —)
+    return dict(key=ch, code=code, windowsVirtualKeyCode=vk, text=ch), shift
+
+class Tab:
+    """Minimal Chrome DevTools connection to one tab."""
+    def __init__(self, ws_url):
+        import websocket
+        self.ws = websocket.create_connection(ws_url, suppress_origin=True)
+        self.n = 0
+
+    def call(self, method, **params):
+        self.n += 1
+        self.ws.send(json.dumps({"id": self.n, "method": method, "params": params}))
+        while True:
+            msg = json.loads(self.ws.recv())
+            if msg.get("id") == self.n:
+                return msg.get("result", {})
+
+def make_tab_press(tab):
+    """Trusted key events straight into one Chrome tab, focused or not."""
+    shift_key = dict(key='Shift', code='ShiftLeft', windowsVirtualKeyCode=16)
+    def press(ch, hold):
+        ev, shift = key_event(ch)
+        mods = 8 if shift else 0
+        if shift:
+            tab.call('Input.dispatchKeyEvent', type='rawKeyDown', modifiers=8, **shift_key)
+        tab.call('Input.dispatchKeyEvent', type='keyDown' if 'text' in ev else 'rawKeyDown',
+                 modifiers=mods, **ev)
+        time.sleep(hold)
+        ev.pop('text', None)
+        tab.call('Input.dispatchKeyEvent', type='keyUp', modifiers=mods, **ev)
+        if shift:
+            tab.call('Input.dispatchKeyEvent', type='keyUp', **shift_key)
+    return press
+
+def find_chrome():
+    candidates = [
+        CHROME_PATH,
+        os.path.expandvars(r'%ProgramFiles%\Google\Chrome\Application\chrome.exe'),
+        os.path.expandvars(r'%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe'),
+        os.path.expandvars(r'%LocalAppData%\Google\Chrome\Application\chrome.exe'),
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        shutil.which('google-chrome'), shutil.which('chromium'), shutil.which('chromium-browser'),
+    ]
+    return next((p for p in candidates if p and os.path.isfile(p)), None)
+
+def devtools(path):
+    return json.load(urlopen(f"http://127.0.0.1:{DEBUG_PORT}{path}", timeout=2))
+
+def ensure_chrome():
+    """Reuse a Chrome already on the debug port, otherwise launch one."""
     try:
-        if key.char == '`':
-            toggle_typing()
-    except AttributeError:
+        devtools("/json/version")
+        return
+    except OSError:
         pass
+    exe = find_chrome()
+    if not exe:
+        sys.exit("Couldn't find Chrome. Set CHROME_PATH at the top of the script.")
+    # Chrome refuses the debug port on your normal profile, so this uses its own.
+    # Sign in to Google there once and it stays signed in.
+    subprocess.Popen([exe, f"--remote-debugging-port={DEBUG_PORT}",
+                      f"--user-data-dir={CHROME_PROFILE}"],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(150):
+        try:
+            devtools("/json/version")
+            return
+        except OSError:
+            time.sleep(0.1)
+    sys.exit("Chrome started but its debug port never came up.")
+
+def focused_tab():
+    """The tab you were in when you hit the hotkey, or None."""
+    for t in devtools("/json/list"):
+        if t.get("type") != "page" or "webSocketDebuggerUrl" not in t:
+            continue
+        tab = Tab(t["webSocketDebuggerUrl"])
+        r = tab.call("Runtime.evaluate", expression="document.hasFocus()")
+        if r.get("result", {}).get("value"):
+            # Keep the page thinking it has focus after you click away.
+            tab.call("Emulation.setFocusEmulationEnabled", enabled=True)
+            return tab
+        tab.ws.close()
+    return None
+
+# ===== TYPING =====
 
 def calculate_char_delay(char_position, base_cpm):
-    """Calculate delay for current character based on sine wave variation."""
+    """Delay for the current character: sine wave speed plus random jitter."""
     wave = math.sin(char_position * WAVE_FREQUENCY)
     speed_multiplier = (MIN_SPEED + MAX_SPEED) / 2 + wave * (MAX_SPEED - MIN_SPEED) / 2
     current_cpm = base_cpm * speed_multiplier
-    return 60.0 / current_cpm
+    return 60.0 / current_cpm * random.uniform(1 - JITTER, 1 + JITTER)
 
 def get_correction_delay():
     """Randomly determine how many characters to type before noticing the error."""
     delays = list(range(len(CORRECTION_DELAY_WEIGHTS)))
     return random.choices(delays, weights=CORRECTION_DELAY_WEIGHTS)[0]
 
-def backspace_and_retype(chars_to_backspace, char_delay):
-    """Backspace N characters and retype them correctly."""
-    global typed_buffer
-    
-    # Backspace
-    for _ in range(chars_to_backspace):
-        time.sleep(char_delay)
-        keyboard.press(Key.backspace)
-        keyboard.release(Key.backspace)
-    
-    # Get the characters that were backspaced
-    chars_to_retype = typed_buffer[-chars_to_backspace:] if chars_to_backspace <= len(typed_buffer) else typed_buffer
-    
-    # Retype them correctly
-    for char in chars_to_retype:
-        time.sleep(char_delay)
-        keyboard.type(char)
+def make_typo(text, i):
+    """Return (wrong keys to type, next index into text) for a typo at text[i]."""
+    c = text[i]
+    kind = random.choices(['double', 'skip', 'swap', 'adjacent'],
+                          weights=[TYPO_DOUBLE_WEIGHT, TYPO_SKIP_WEIGHT,
+                                   TYPO_SWAP_WEIGHT, TYPO_ADJACENT_WEIGHT])[0]
+    if kind == 'skip':
+        return [], i + 1
+    if kind == 'swap' and i + 1 < len(text) and text[i + 1].isalpha():
+        return [text[i + 1], c], i + 2
+    if kind == 'adjacent' and c.lower() in ADJACENT_KEYS:
+        wrong = random.choice(ADJACENT_KEYS[c.lower()])
+        return [wrong.upper() if c.isupper() else wrong], i + 1
+    return [c, c], i + 1
 
-def simulate_typo(char, char_delay, fix=True, correction_delay=0):
-    """Simulate a typing mistake: type character twice then backspace."""
-    time.sleep(char_delay)
-    keyboard.type(char)
-    if fix:
-        if correction_delay == 0:
-            # Fix immediately
-            time.sleep(char_delay + TYPO_REALIZE_DELAY)
-            keyboard.press(Key.backspace)
-            keyboard.release(Key.backspace)
-            time.sleep(char_delay)
-        else:
-            # Will fix after typing more characters
-            return correction_delay + 1  # +1 for the duplicate char
-    else:
-        time.sleep(char_delay)
-    return 0
+def pause_after(c):
+    """Thinking pauses. Triangular with mode at max, so longer pauses are more likely."""
+    if c == ' ' and random.random() < PAUSE_AFTER_SPACE_PROBABILITY:
+        time.sleep(random.triangular(PAUSE_SPACE_MIN, PAUSE_SPACE_MAX, PAUSE_SPACE_MAX))
+    elif c in './;:()?!' and random.random() < PAUSE_AFTER_PUNCTUATION_PROBABILITY:
+        time.sleep(random.triangular(PAUSE_PUNCTUATION_MIN, PAUSE_PUNCTUATION_MAX, PAUSE_PUNCTUATION_MAX))
+    elif c == '\n' and random.random() < PAUSE_AFTER_NEWLINE_PROBABILITY:
+        time.sleep(random.triangular(PAUSE_NEWLINE_MIN, PAUSE_NEWLINE_MAX, PAUSE_NEWLINE_MAX))
 
-def simulate_skip_char(char, char_delay, fix=True, correction_delay=0):
-    """Skip a character, then realize and go back to type it."""
-    if fix:
-        if correction_delay == 0:
-            # Fix immediately
-            time.sleep(char_delay + TYPO_REALIZE_DELAY)
-            keyboard.type(char)
-            time.sleep(char_delay)
-        else:
-            # Will fix after typing more characters
-            return correction_delay + 1  # +1 for the missing char
-    else:
-        time.sleep(char_delay)
-    return 0
+def type_text(text, press):
+    """Type text with human timing and typos. Returns what actually ended up typed."""
+    text = list(text)
+    screen = []      # what has actually been typed so far
+    i = 0            # next index of text to type
+    notice = None    # keystrokes left before the pending typo gets noticed
+    base_cpm = WPM * CHARS_PER_WORD
 
-def simulate_swap_chars(char1, char2, char_delay, fix=True, correction_delay=0):
-    """Type two characters in wrong order, backspace, then type correctly."""
-    time.sleep(char_delay)
-    keyboard.type(char2)
-    if fix:
-        if correction_delay == 0:
-            # Fix immediately
-            time.sleep(char_delay + TYPO_REALIZE_DELAY)
-            keyboard.press(Key.backspace)
-            keyboard.release(Key.backspace)
-            time.sleep(char_delay)
-            keyboard.press(Key.backspace)
-            keyboard.release(Key.backspace)
-            time.sleep(char_delay)
-            keyboard.type(char1)
-            time.sleep(char_delay)
-            keyboard.type(char2)
-            time.sleep(char_delay)
-        else:
-            # Will fix after typing more characters
-            return correction_delay + 2  # +2 for both swapped chars
-    else:
-        time.sleep(char_delay)
-    return 0
+    def key(ch):
+        delay = calculate_char_delay(len(screen), base_cpm)
+        hold = random.uniform(KEY_HOLD_MIN, KEY_HOLD_MAX)
+        press(ch, hold)
+        time.sleep(max(0, delay - hold))
 
-def simulate_adjacent_typo(char, char_delay, fix=True, correction_delay=0):
-    """Type an adjacent key by mistake, then backspace and correct."""
-    char_lower = char.lower()
-    if char_lower in ADJACENT_KEYS:
-        wrong_char = random.choice(ADJACENT_KEYS[char_lower])
-        # Preserve case
-        if char.isupper():
-            wrong_char = wrong_char.upper()
-        
-        time.sleep(char_delay)
-        keyboard.type(wrong_char)
-        if fix:
-            if correction_delay == 0:
-                # Fix immediately
-                time.sleep(char_delay + TYPO_REALIZE_DELAY)
-                keyboard.press(Key.backspace)
-                keyboard.release(Key.backspace)
-                time.sleep(char_delay)
-                keyboard.type(char)
-                time.sleep(char_delay)
+    while i < len(text) or screen != text:
+        running.wait()
+
+        if notice == 0 or (notice is not None and i >= len(text)):
+            # Noticed the mistake: backspace to the last correct character, carry on from there.
+            time.sleep(TYPO_REALIZE_DELAY)
+            while screen != text[:len(screen)]:
+                key('\b')
+                screen.pop()
+            i = len(screen)
+            notice = None
+            continue
+
+        c = text[i]
+        if notice is None and c.isalpha() and random.random() < TYPO_PROBABILITY:
+            wrong, i = make_typo(text, i)
+            for ch in wrong:
+                key(ch)
+                screen.append(ch)
+            if random.random() < TYPO_UNCORRECTED_PROBABILITY:
+                text = screen + text[i:]   # leave it; the typo is now part of the text
+                i = len(screen)
             else:
-                # Will fix after typing more characters
-                return correction_delay + 1  # +1 for the wrong char
-        else:
-            time.sleep(char_delay)
-    else:
-        # Fallback to double-type if char not in map
-        return simulate_typo(char, char_delay, fix, correction_delay)
-    return 0
+                notice = get_correction_delay()
+            continue
 
-def pause_after_space():
-    """Simulate a thinking pause after typing a space with linear probability weighting."""
-    pause_duration = random.triangular(PAUSE_SPACE_MIN, PAUSE_SPACE_MAX, PAUSE_SPACE_MAX)
-    time.sleep(pause_duration)
+        key(c)
+        screen.append(c)
+        i += 1
+        if notice is not None:
+            notice -= 1
+        pause_after(c)
 
-def pause_after_period():
-    """Simulate a thinking pause after typing a period with linear probability weighting."""
-    pause_duration = random.triangular(PAUSE_PUNCTUATION_MIN, PAUSE_PUNCTUATION_MAX, PAUSE_PUNCTUATION_MAX)
-    time.sleep(pause_duration)
-
-def pause_after_newline():
-    """Simulate a thinking pause after typing a newline with linear probability weighting."""
-    pause_duration = random.triangular(PAUSE_NEWLINE_MIN, PAUSE_NEWLINE_MAX, PAUSE_NEWLINE_MAX)
-    time.sleep(pause_duration)
+    return ''.join(screen)
 
 def main():
-    global text, position, typed_buffer
-    
-    text = pyperclip.paste()
+    background = BACKGROUND
+    if '--foreground' in sys.argv:
+        background = False
+    if '--background' in sys.argv:
+        background = True
+
+    text = pyperclip.paste().replace('\r\n', '\n')
     if not text:
         print("No text in clipboard!")
         return
-    
+
     print(f"Loaded {len(text)} characters from clipboard")
     print(f"Speed: {WPM} WPM")
-    print("\nPress ` to start/stop typing")
-    
+
+    def on_press(k):
+        if k == HOTKEY:
+            if running.is_set():
+                running.clear()
+                print("⏸ Paused typing")
+            else:
+                running.set()
+                print("▶ Started typing")
+
     listener = Listener(on_press=on_press)
     listener.start()
-    
-    base_cpm = WPM * CHARS_PER_WORD
-    pending_correction = 0  # Number of chars to backspace for delayed correction
-    in_correction_mode = False  # Flag to prevent typos during corrections
-    
-    while position < len(text):
-        if typing:
-            char_delay = calculate_char_delay(position, base_cpm)
-            
-            # Check if we need to do a delayed correction
-            if pending_correction > 0:
-                in_correction_mode = True
-                time.sleep(char_delay + TYPO_REALIZE_DELAY)
-                backspace_and_retype(pending_correction, char_delay)
-                pending_correction = 0
-                in_correction_mode = False
-                continue
-            
-            keyboard.type(text[position])
-            current_char = text[position]
-            typed_buffer.append(current_char)
-            position += 1
-            time.sleep(char_delay)
-            
-            # Check if we should pause based on character type
-            if current_char == ' ' and random.random() < PAUSE_AFTER_SPACE_PROBABILITY:
-                pause_after_space()
-            elif current_char in './;:()?!' and random.random() < PAUSE_AFTER_PUNCTUATION_PROBABILITY:
-                pause_after_period()
-            elif current_char == '\n' and random.random() < PAUSE_AFTER_NEWLINE_PROBABILITY:
-                pause_after_newline()
-            
-            # Randomly make a typo (but not when correcting another typo)
-            if not in_correction_mode and random.random() < TYPO_PROBABILITY:
-                # Decide if typo will be corrected
-                fix_typo = random.random() >= TYPO_UNCORRECTED_PROBABILITY
-                correction_delay = get_correction_delay() if fix_typo else 0
-                
-                # Weighted random choice of typo type
-                typo_types = ['double', 'skip', 'swap', 'adjacent']
-                typo_weights = [TYPO_DOUBLE_WEIGHT, TYPO_SKIP_WEIGHT, TYPO_SWAP_WEIGHT, TYPO_ADJACENT_WEIGHT]
-                typo_type = random.choices(typo_types, weights=typo_weights)[0]
-                
-                if typo_type == 'double':
-                    pending_correction = simulate_typo(current_char, char_delay, fix_typo, correction_delay)
-                elif typo_type == 'skip':
-                    # Skip next character, then fix it
-                    if position < len(text):
-                        next_char = text[position]
-                        position += 1
-                        time.sleep(char_delay)
-                        typed_buffer.append(next_char)
-                        pending_correction = simulate_skip_char(next_char, char_delay, fix_typo, correction_delay)
-                elif typo_type == 'swap':
-                    # Swap current and next character
-                    if position < len(text):
-                        next_char = text[position]
-                        pending_correction = simulate_swap_chars(current_char, next_char, char_delay, fix_typo, correction_delay)
-                        position += 1
-                        typed_buffer.append(next_char)
-                elif typo_type == 'adjacent':
-                    # Type adjacent key instead
-                    pending_correction = simulate_adjacent_typo(current_char, char_delay, fix_typo, correction_delay)
-        else:
-            time.sleep(0.1)
-    
+
+    if background:
+        ensure_chrome()
+        print("\nIn the Chrome window this opened: open your doc, click where the text should go,")
+        print("then press F9. After that you can use anything else. F9 again pauses/resumes.")
+        while True:
+            running.wait()
+            tab = focused_tab()
+            if tab:
+                break
+            running.clear()
+            print("No focused Chrome tab found. Click into the doc in that Chrome window, then press F9.")
+        press = make_tab_press(tab)
+    else:
+        print("\nClick into the target app and press F9 to start/stop typing")
+        press = make_os_press()
+
+    type_text(text, press)
     print("\n✓ Complete!")
     listener.stop()
 
 if __name__ == "__main__":
     main()
-
