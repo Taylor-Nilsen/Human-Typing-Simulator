@@ -33,7 +33,15 @@ TYPO_ADJACENT_WEIGHT = 2    # Type adjacent key
 
 # Typo correction timing
 TYPO_REALIZE_DELAY = 0.175    # Delay before starting to correct a typo (seconds)
-TYPO_UNCORRECTED_PROBABILITY = 0.1  # Chance typo is not corrected (0.05 = 5%)
+TYPO_UNCORRECTED_PROBABILITY = 0.1  # Chance typo is missed while typing (0.05 = 5%)
+
+# Proofreading: once the text is done, go back with the arrow keys and fix missed typos.
+# False = missed typos stay in for good.
+PROOFREAD = True
+PROOFREAD_PAUSE_MIN = 0.8     # "Reading" pause before each fix (seconds)
+PROOFREAD_PAUSE_MAX = 3.0
+KEY_REPEAT_DELAY = 0.5        # Holding an arrow key: delay before it starts repeating
+KEY_REPEAT_INTERVAL = 0.033   # then one move per this many seconds (~30/s, OS default)
 
 # Delayed correction weights (how many extra chars typed before noticing)
 # 0 = immediate, 1 = after 1 char, 2 = after 2 chars, etc.
@@ -99,16 +107,24 @@ ADJACENT_KEYS = {
 running = threading.Event()  # set = typing, clear = paused
 
 # ===== KEY SENDERS =====
-# press(ch, hold) sends one full keystroke. '\b' means backspace.
+# press(ch, hold, repeats) sends one full keystroke. '\b' means backspace, LEFT the left
+# arrow. repeats > 1 holds the key down long enough to auto-repeat that many times.
 
-OS_SPECIAL = {'\b': Key.backspace, '\n': Key.enter, '\t': Key.tab}
+LEFT = 'ArrowLeft'
+OS_SPECIAL = {'\b': Key.backspace, '\n': Key.enter, '\t': Key.tab, LEFT: Key.left}
+
+def repeat_wait(r):
+    time.sleep(KEY_REPEAT_DELAY if r == 0 else KEY_REPEAT_INTERVAL)
 
 def make_os_press():
     """Real OS keystrokes into the focused window."""
     keyboard = Controller()
-    def press(ch, hold):
+    def press(ch, hold, repeats=1):
         k = OS_SPECIAL.get(ch, ch)
         keyboard.press(k)
+        for r in range(repeats - 1):
+            repeat_wait(r)
+            keyboard.press(k)
         time.sleep(hold)
         keyboard.release(k)
     return press
@@ -119,7 +135,8 @@ PUNCT_CODES = {'`': ('Backquote', 192), '-': ('Minus', 189), '=': ('Equal', 187)
                '[': ('BracketLeft', 219), ']': ('BracketRight', 221), '\\': ('Backslash', 220),
                ';': ('Semicolon', 186), "'": ('Quote', 222), ',': ('Comma', 188),
                '.': ('Period', 190), '/': ('Slash', 191), ' ': ('Space', 32)}
-NAMED_KEYS = {'\b': ('Backspace', 8, None), '\n': ('Enter', 13, '\r'), '\t': ('Tab', 9, '\t')}
+NAMED_KEYS = {'\b': ('Backspace', 8, None), '\n': ('Enter', 13, '\r'), '\t': ('Tab', 9, '\t'),
+              LEFT: ('ArrowLeft', 37, None)}
 
 def key_event(ch):
     """Return (DevTools key event fields, needs_shift) for one character."""
@@ -159,13 +176,16 @@ class Tab:
 def make_tab_press(tab):
     """Trusted key events straight into one Chrome tab, focused or not."""
     shift_key = dict(key='Shift', code='ShiftLeft', windowsVirtualKeyCode=16)
-    def press(ch, hold):
+    def press(ch, hold, repeats=1):
         ev, shift = key_event(ch)
         mods = 8 if shift else 0
         if shift:
             tab.call('Input.dispatchKeyEvent', type='rawKeyDown', modifiers=8, **shift_key)
-        tab.call('Input.dispatchKeyEvent', type='keyDown' if 'text' in ev else 'rawKeyDown',
-                 modifiers=mods, **ev)
+        down = 'keyDown' if 'text' in ev else 'rawKeyDown'
+        tab.call('Input.dispatchKeyEvent', type=down, modifiers=mods, **ev)
+        for r in range(repeats - 1):
+            repeat_wait(r)
+            tab.call('Input.dispatchKeyEvent', type=down, modifiers=mods, autoRepeat=True, **ev)
         time.sleep(hold)
         ev.pop('text', None)
         tab.call('Input.dispatchKeyEvent', type='keyUp', modifiers=mods, **ev)
@@ -268,6 +288,7 @@ def type_text(text, press):
     screen = []      # what has actually been typed so far
     i = 0            # next index of text to type
     notice = None    # keystrokes left before the pending typo gets noticed
+    missed = []      # (start, wrong, right) typos left in for the proofread
     base_cpm = WPM * CHARS_PER_WORD
 
     def key(ch):
@@ -291,11 +312,14 @@ def type_text(text, press):
 
         c = text[i]
         if notice is None and c.isalpha() and random.random() < TYPO_PROBABILITY:
+            start = i
             wrong, i = make_typo(text, i)
             for ch in wrong:
                 key(ch)
                 screen.append(ch)
             if random.random() < TYPO_UNCORRECTED_PROBABILITY:
+                if wrong != text[start:i]:
+                    missed.append((start, wrong, text[start:i]))
                 text = screen + text[i:]   # leave it; the typo is now part of the text
                 i = len(screen)
             else:
@@ -308,6 +332,29 @@ def type_text(text, press):
         if notice is not None:
             notice -= 1
         pause_after(c)
+
+    if PROOFREAD:
+        # Walk back from the end with the left arrow, fixing missed typos last to first,
+        # so fixing one never shifts the position of the ones still ahead.
+        # ponytail: counts one arrow press per character. Apps that rewrite text as you
+        # type (Docs turning "1. " into a list) shift positions and throw this off.
+        caret = len(screen)
+        for start, wrong, right in reversed(missed):
+            running.wait()
+            time.sleep(random.uniform(PROOFREAD_PAUSE_MIN, PROOFREAD_PAUSE_MAX))
+            n = caret - (start + len(wrong))
+            if n > 4:
+                press(LEFT, random.uniform(KEY_HOLD_MIN, KEY_HOLD_MAX), n)  # hold it down
+            else:
+                for _ in range(n):
+                    key(LEFT)
+            time.sleep(TYPO_REALIZE_DELAY)
+            for _ in wrong:
+                key('\b')
+            for ch in right:
+                key(ch)
+            screen[start:start + len(wrong)] = right
+            caret = start + len(right)
 
     return ''.join(screen)
 

@@ -66,7 +66,9 @@ All settings are at the top of `keyboard_simulator.py`:
 
 ### Typo Settings
 - `TYPO_PROBABILITY` - Chance of making a typo on a letter (0.025 = 2.5%)
-- `TYPO_UNCORRECTED_PROBABILITY` - Chance typo stays uncorrected (0.1 = 10%)
+- `TYPO_UNCORRECTED_PROBABILITY` - Chance a typo is missed while typing (0.1 = 10%)
+- `PROOFREAD` - Go back at the end and fix missed typos (default: True). False leaves them in
+- `PROOFREAD_PAUSE_MIN` / `PROOFREAD_PAUSE_MAX` - Reading pause before each proofread fix
 - `TYPO_*_WEIGHT` - Relative probability of each typo type
 - `CORRECTION_DELAY_WEIGHTS` - When mistakes are noticed (immediate vs delayed)
 
@@ -94,6 +96,11 @@ When a typo occurs, the script probabilistically decides when to notice it:
 - Decreasing probabilities up to 5 characters later
 
 When noticed, it backspaces to the last correct character and keeps typing from there.
+
+### Proofreading
+Some typos (`TYPO_UNCORRECTED_PROBABILITY`) get missed while typing. Once the text is done, it goes back with the left arrow (tapping for short hops, holding the key down for long ones), fixes each missed typo, and moves on to the next one, last to first.
+
+This counts one arrow press per character, so apps that rewrite text as you type (e.g. Google Docs turning `1. ` at the start of a line into a numbered list) can throw the positions off. Set `PROOFREAD = False` if your text triggers that.
 
 ### Thinking Pauses
 Uses triangular distribution (y=x curve) where longer pauses are more likely than shorter ones:
