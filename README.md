@@ -9,7 +9,8 @@ A sophisticated Python script that simulates realistic human typing behavior by 
 🔧 **Smart Corrections** - Weighted delayed corrections that catch mistakes after typing 0-5 more characters  
 ⏸️ **Thinking Pauses** - Natural pauses after spaces, punctuation, and newlines with configurable probabilities  
 🎚️ **Highly Configurable** - All parameters organized at the top of the script for easy customization  
-⌨️ **Toggle Control** - Press ` (backtick) to start/pause typing at any time
+⌨️ **Toggle Control** - Press F9 to start/pause typing from any app
+🪟 **Background Mode** - Types into a Chrome tab while you keep using your keyboard and mouse in other apps and tabs
 
 ## Installation
 
@@ -22,32 +23,59 @@ System Preferences > Security & Privacy > Privacy > Accessibility
 
 ## Usage
 
+### Background mode (default)
+
 1. Copy text to clipboard
 2. Run: `python keyboard_simulator.py`
-3. Switch to your target application
-4. Press `` ` `` (backtick) to start typing
-5. Press `` ` `` again to pause/resume
-6. Script completes automatically when done
+3. A separate Chrome window opens (its own profile, so sign in to Google there the first time; it remembers you after that)
+4. Open your doc in that window and click where the text should go
+5. Press `F9`. From here on you can use any other app, window, or tab, including your normal Chrome
+6. Press `F9` again (from anywhere) to pause/resume
+7. Script exits when done
+
+The page gets normal trusted `keydown`/`keypress`/`input`/`keyup` events with real key codes, Shift for capitals, and realistic key hold times. It also keeps thinking it's the focused, visible tab while you're somewhere else.
+
+Notes:
+- Only works for pages in that Chrome window, not desktop apps. Use foreground mode for those.
+- Don't close that Chrome window or the target tab while it's typing.
+- While that Chrome window is open, any program on your machine can control it through port 9222. Close it when you're done.
+
+### Foreground mode
+
+Types real OS keystrokes into whatever window has focus (any app, but you can't use your keyboard while it runs).
+
+1. Copy text to clipboard
+2. Run: `python keyboard_simulator.py --foreground` (or set `BACKGROUND = False`)
+3. Click into the target app and press `F9`
 
 ## Configuration
 
 All settings are at the top of `keyboard_simulator.py`:
 
+### Mode
+- `BACKGROUND` - `True` types into a Chrome tab in the background, `False` types into the focused window
+- `HOTKEY` - Start/pause key (default: F9)
+- `CHROME_PATH` - Set this if Chrome isn't found automatically
+
 ### Typing Speed
 - `WPM` - Base words per minute (default: 80)
+- `JITTER` - Random variation on every keystroke delay (0.25 = ±25%)
+- `KEY_HOLD_MIN` / `KEY_HOLD_MAX` - How long each key is held down
 - `MIN_SPEED` / `MAX_SPEED` - Speed variation range (0.80 to 1.20 = ±20%)
 - `WAVE_FREQUENCY` - How fast speed oscillates (default: 0.3)
 
 ### Typo Settings
-- `TYPO_PROBABILITY` - Chance of making a typo (0.05 = 5%)
-- `TYPO_UNCORRECTED_PROBABILITY` - Chance typo stays uncorrected (0.1 = 10%)
+- `TYPO_PROBABILITY` - Chance of making a typo on a letter (0.025 = 2.5%)
+- `TYPO_UNCORRECTED_PROBABILITY` - Chance a typo is missed while typing (0.1 = 10%)
+- `PROOFREAD` - Go back at the end and fix missed typos (default: True). False leaves them in
+- `PROOFREAD_PAUSE_MIN` / `PROOFREAD_PAUSE_MAX` - Reading pause before each proofread fix
 - `TYPO_*_WEIGHT` - Relative probability of each typo type
 - `CORRECTION_DELAY_WEIGHTS` - When mistakes are noticed (immediate vs delayed)
 
 ### Pause Settings
 - `PAUSE_AFTER_SPACE_PROBABILITY` - Pause after space (0.05 = 5%)
-- `PAUSE_AFTER_PERIOD_PROBABILITY` - Pause after punctuation (0.15 = 15%)
-- `PAUSE_AFTER_NEWLINE_PROBABILITY` - Pause after newlines (0.3 = 30%)
+- `PAUSE_AFTER_PUNCTUATION_PROBABILITY` - Pause after punctuation (0.2 = 20%)
+- `PAUSE_AFTER_NEWLINE_PROBABILITY` - Pause after newlines (0.9 = 90%)
 - Duration ranges for each pause type (min/max in seconds)
 
 ## How It Works
@@ -67,13 +95,18 @@ When a typo occurs, the script probabilistically decides when to notice it:
 - 12.5% chance: after 1 more character
 - Decreasing probabilities up to 5 characters later
 
-When noticed, it backtracks, deletes the error, and retypes correctly.
+When noticed, it backspaces to the last correct character and keeps typing from there.
+
+### Proofreading
+Some typos (`TYPO_UNCORRECTED_PROBABILITY`) get missed while typing. Once the text is done, it goes back with the left arrow (tapping for short hops, holding the key down for long ones), fixes each missed typo, and moves on to the next one, last to first.
+
+This counts one arrow press per character, so apps that rewrite text as you type (e.g. Google Docs turning `1. ` at the start of a line into a numbered list) can throw the positions off. Set `PROOFREAD = False` if your text triggers that.
 
 ### Thinking Pauses
 Uses triangular distribution (y=x curve) where longer pauses are more likely than shorter ones:
-- **Space pauses**: 0.3-2.5 seconds (between words)
-- **Period pauses**: 0.5-3.5 seconds (end of sentence)
-- **Newline pauses**: 1.0-5.0 seconds (end of paragraph)
+- **Space pauses**: 0.32-2.5 seconds (between words)
+- **Punctuation pauses**: 0.05-4.0 seconds (end of sentence)
+- **Newline pauses**: 2.0-5.0 seconds (end of paragraph)
 
 ## Example Settings
 
@@ -95,14 +128,18 @@ TYPO_UNCORRECTED_PROBABILITY = 0.3
 ```python
 PAUSE_AFTER_SPACE_PROBABILITY = 0.15
 PAUSE_SPACE_MAX = 4.0
-PAUSE_AFTER_PERIOD_PROBABILITY = 0.4
+PAUSE_AFTER_PUNCTUATION_PROBABILITY = 0.4
 ```
 
 ## Requirements
 
-- Python 3.7+
+- Python 3.8+
 - pyperclip
 - pynput
+- websocket-client
+- Google Chrome (background mode)
+
+Logic self-check: `python test_typing.py`
 
 ## License
 
